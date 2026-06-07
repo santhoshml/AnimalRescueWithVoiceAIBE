@@ -1,4 +1,4 @@
-import { MossClient, type DocumentInfo } from "@inferedge/moss";
+import { MossClient, type DocumentInfo } from "@moss-dev/moss";
 import { env } from "../config/env.js";
 import type { KbDocument } from "../types/kb.js";
 

@@ -32,6 +32,7 @@ export class UnsiloedUpstreamError extends Error {
 export class UnsiloedClient {
     private readonly parsePollIntervalMs = 5_000;
     private readonly parseMaxAttempts = 60;
+    private readonly parseHttpMaxRetries = 5;
 
     private get isConfigured(): boolean {
         return Boolean(
@@ -201,22 +202,17 @@ export class UnsiloedClient {
         const form = new FormData();
         form.append("file", new Blob([bytes], { type: mimeType }), filename);
 
-        let response: globalThis.Response;
-        try {
-            response = await fetch(`${env.unsiloedBaseUrl}/parse`, {
+        const response = await this.fetchWithRateLimitRetry(
+            `${env.unsiloedBaseUrl}/parse`,
+            {
                 method: "POST",
                 headers: {
                     "api-key": env.unsiloedApiKey!
                 },
                 body: form
-            });
-        } catch (error) {
-            throw new UnsiloedUpstreamError({
-                message: `Unsiloed parse network error: ${error instanceof Error ? error.message : "unknown"}`,
-                service: "unsiloed",
-                errorCode: "UNSILOED_NETWORK_ERROR"
-            });
-        }
+            },
+            "parse submit"
+        );
 
         if (!response.ok) {
             throw new UnsiloedUpstreamError({
@@ -254,21 +250,16 @@ export class UnsiloedClient {
         chunks?: unknown[];
     }> {
         for (let attempt = 0; attempt < this.parseMaxAttempts; attempt += 1) {
-            let response: globalThis.Response;
-            try {
-                response = await fetch(`${env.unsiloedBaseUrl}/parse/${jobId}`, {
+            const response = await this.fetchWithRateLimitRetry(
+                `${env.unsiloedBaseUrl}/parse/${jobId}`,
+                {
                     method: "GET",
                     headers: {
                         "api-key": env.unsiloedApiKey!
                     }
-                });
-            } catch (error) {
-                throw new UnsiloedUpstreamError({
-                    message: `Unsiloed parse status network error: ${error instanceof Error ? error.message : "unknown"}`,
-                    service: "unsiloed",
-                    errorCode: "UNSILOED_NETWORK_ERROR"
-                });
-            }
+                },
+                "parse status"
+            );
 
             if (!response.ok) {
                 throw new UnsiloedUpstreamError({
@@ -310,6 +301,60 @@ export class UnsiloedClient {
             message: "Unsiloed parse job timeout",
             service: "unsiloed",
             errorCode: "UNSILOED_TIMEOUT"
+        });
+    }
+
+    private async fetchWithRateLimitRetry(
+        url: string,
+        init: RequestInit,
+        opLabel: string
+    ): Promise<Response> {
+        let lastError: unknown = null;
+        for (let attempt = 1; attempt <= this.parseHttpMaxRetries; attempt += 1) {
+            try {
+                const response = await fetch(url, init);
+                if (response.status !== 429) {
+                    return response;
+                }
+                lastError = new UnsiloedUpstreamError({
+                    message: `Unsiloed ${opLabel} rate limited with status 429`,
+                    service: "unsiloed",
+                    errorCode: "UNSILOED_RATE_LIMIT",
+                    upstreamStatus: 429,
+                    responseSnippet: await this.readResponseSnippet(response),
+                    requestId: this.readRequestId(response)
+                });
+            } catch (error) {
+                lastError = error;
+                if (attempt === this.parseHttpMaxRetries) {
+                    break;
+                }
+            }
+
+            const backoffMs = 500 * 2 ** (attempt - 1) + Math.floor(Math.random() * 250);
+            console.warn("Unsiloed request throttled/retry", {
+                opLabel,
+                attempt,
+                maxAttempts: this.parseHttpMaxRetries,
+                backoffMs
+            });
+            await this.sleep(backoffMs);
+        }
+
+        if (lastError instanceof UnsiloedUpstreamError) {
+            throw lastError;
+        }
+        if (lastError instanceof Error) {
+            throw new UnsiloedUpstreamError({
+                message: `Unsiloed ${opLabel} network error: ${lastError.message}`,
+                service: "unsiloed",
+                errorCode: "UNSILOED_NETWORK_ERROR"
+            });
+        }
+        throw new UnsiloedUpstreamError({
+            message: `Unsiloed ${opLabel} failed after retries`,
+            service: "unsiloed",
+            errorCode: "UNSILOED_HTTP_ERROR"
         });
     }
 

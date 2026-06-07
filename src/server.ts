@@ -1,7 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import { AccessToken } from "livekit-server-sdk";
+import { AccessToken, AgentDispatchClient } from "livekit-server-sdk";
 import multer from "multer";
 import { mkdir } from "node:fs/promises";
 import { extname, join } from "node:path";
@@ -18,6 +18,14 @@ import type { CaseRecord, UploadedFile } from "./types/case.js";
 import type { CaseStatus } from "./types/case.js";
 import { KbStore } from "./services/kbStore.js";
 import type { KbDocument } from "./types/kb.js";
+
+process.on("unhandledRejection", (reason) => {
+    console.error("[PROCESS] unhandledRejection", reason);
+});
+
+process.on("uncaughtException", (error) => {
+    console.error("[PROCESS] uncaughtException", error);
+});
 
 const app = express();
 app.use(cors());
@@ -77,6 +85,11 @@ app.use((req, res, next) => {
 });
 
 const caseStore = new CaseStore();
+const dispatchClient = new AgentDispatchClient(
+    env.livekitUrl,
+    env.livekitApiKey,
+    env.livekitApiSecret
+);
 const kbStore = new KbStore();
 const eventBus = new CaseEventBus();
 const kbEventBus = new CaseEventBus();
@@ -169,7 +182,308 @@ function isUnknownOrEmpty(value: unknown): boolean {
 }
 
 function isCaseDisplayable(record: CaseRecord): boolean {
-    return !isUnknownOrEmpty(record.animal) && !isUnknownOrEmpty(record.city);
+    const hasAnimal = typeof record?.animal === "string" && record.animal.trim().length > 0;
+    const hasCity = typeof record?.city === "string" && record.city.trim().length > 0;
+    const hasZip = typeof record?.zip === "string" && record.zip.trim().length > 0;
+    return hasAnimal && (hasCity || hasZip);
+}
+
+function normalizeSpokenPhone(input: string): string | null {
+    const cleaned = input.toLowerCase().replace(/[^a-z0-9+\s]/g, " ");
+    const tokens = cleaned.split(/\s+/).filter((t) => t.length > 0);
+    const digitMap: Record<string, string> = {
+        zero: "0",
+        oh: "0",
+        o: "0",
+        one: "1",
+        two: "2",
+        three: "3",
+        four: "4",
+        five: "5",
+        six: "6",
+        seven: "7",
+        eight: "8",
+        nine: "9"
+    };
+
+    const expanded: string[] = [];
+    for (let i = 0; i < tokens.length; i += 1) {
+        const token = tokens[i]!;
+        if ((token === "double" || token === "triple") && i + 1 < tokens.length) {
+            const next = tokens[i + 1]!;
+            const mapped = digitMap[next] ?? (/^\d$/.test(next) ? next : "");
+            if (mapped) {
+                expanded.push(mapped);
+                expanded.push(mapped);
+                if (token === "triple") {
+                    expanded.push(mapped);
+                }
+                i += 1;
+                continue;
+            }
+        }
+
+        if (digitMap[token]) {
+            expanded.push(digitMap[token]);
+            continue;
+        }
+        if (/^\d+$/.test(token)) {
+            expanded.push(token);
+        }
+    }
+
+    const digitsOnly = expanded.join("").replace(/\D/g, "");
+    if (digitsOnly.length >= 7) {
+        return digitsOnly;
+    }
+    return null;
+}
+
+function toAbsoluteUploadUrl(req: Request, file: UploadedFile): string | undefined {
+    if (typeof file.url === "string" && /^https?:\/\//i.test(file.url)) {
+        return file.url;
+    }
+
+    const host = req.get("host");
+    if (!host) {
+        return file.url;
+    }
+
+    const pathCandidate = (file.url ?? file.localPath).replace(/\\/g, "/");
+    const marker = "/uploads/";
+    const markerIndex = pathCandidate.lastIndexOf(marker);
+    const uploadPath =
+        markerIndex >= 0
+            ? pathCandidate.slice(markerIndex)
+            : pathCandidate.startsWith("uploads/")
+              ? `/${pathCandidate}`
+              : undefined;
+
+    if (!uploadPath) {
+        return file.url;
+    }
+
+    return `${req.protocol}://${host}${uploadPath}`;
+}
+
+function withCaseResponseShape(req: Request, record: CaseRecord): CaseRecord {
+    const normalizeFile = (file: UploadedFile): UploadedFile => ({
+        ...file,
+        url: toAbsoluteUploadUrl(req, file),
+        summary: file.summary ?? null,
+        speciesGuess: file.speciesGuess ?? null,
+        speciesConfidence:
+            typeof file.speciesConfidence === "number" ? file.speciesConfidence : null,
+        isLikelyEndangered:
+            typeof file.isLikelyEndangered === "boolean" ? file.isLikelyEndangered : null,
+        endangeredConfidence:
+            typeof file.endangeredConfidence === "number" ? file.endangeredConfidence : null
+    });
+
+    const normalizedConfidence =
+        typeof record.context.confidence === "number" &&
+        Number.isFinite(record.context.confidence)
+            ? Math.max(0, Math.min(1, record.context.confidence))
+            : null;
+    const normalizedLocationConfidence =
+        typeof record.locationConfidence === "number" && Number.isFinite(record.locationConfidence)
+            ? Math.max(0, Math.min(1, record.locationConfidence))
+            : null;
+
+    return {
+        ...record,
+        locationSource: record.locationSource ?? null,
+        locationConfidence: normalizedLocationConfidence,
+        locationUpdatedAt: record.locationUpdatedAt ?? null,
+        context: {
+            ...record.context,
+            confidence: normalizedConfidence
+        },
+        images: record.images.map(normalizeFile),
+        protocols: record.protocols.map(normalizeFile)
+    };
+}
+
+function makePublicReferenceId(): string {
+    const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let out = "";
+    for (let i = 0; i < 4; i += 1) {
+        out += alphabet[Math.floor(Math.random() * alphabet.length)];
+    }
+    return out;
+}
+
+const allowedCaseStatuses: readonly CaseStatus[] = [
+    "open",
+    "triaged",
+    "guidance_provided",
+    "rescue_onway",
+    "rescue_complete",
+    "closed"
+] as const;
+
+async function generateUniquePublicReferenceId(): Promise<string> {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+        const candidate = makePublicReferenceId();
+        const existing = await caseStore.list({ page: 1, pageSize: 500 });
+        if (!existing.items.some((item) => item.publicReferenceId === candidate)) {
+            return candidate;
+        }
+    }
+    return makePublicReferenceId();
+}
+
+type InferredLocation = {
+    city?: string;
+    state?: string;
+    zip?: string;
+    country?: string;
+    locationSource: "telephony" | "number_lookup" | "ip";
+    locationConfidence: number;
+    fallbackReason?: string;
+};
+
+function normalizeLocationString(value: unknown): string | undefined {
+    if (typeof value !== "string") {
+        return undefined;
+    }
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function pickLocationCandidate(raw: unknown): {
+    city?: string;
+    state?: string;
+    zip?: string;
+    country?: string;
+} | null {
+    if (!raw || typeof raw !== "object") {
+        return null;
+    }
+    const record = raw as Record<string, unknown>;
+    const city = normalizeLocationString(record.city);
+    const state = normalizeLocationString(record.state);
+    const zip = normalizeLocationString(record.zip ?? record.postalCode ?? record.postal_code);
+    const country = normalizeLocationString(record.country ?? record.countryCode ?? record.country_code);
+    if (!city && !state && !zip && !country) {
+        return null;
+    }
+    return { city, state, zip, country };
+}
+
+function getClientIp(req: Request): string | undefined {
+    const xff = req.headers["x-forwarded-for"];
+    const forwarded = typeof xff === "string" ? xff.split(",")[0]?.trim() : undefined;
+    const ip = forwarded || req.ip || undefined;
+    return ip?.replace(/^::ffff:/, "");
+}
+
+function isPrivateIp(ip: string): boolean {
+    return (
+        ip.startsWith("10.") ||
+        ip.startsWith("192.168.") ||
+        ip.startsWith("172.16.") ||
+        ip.startsWith("172.17.") ||
+        ip.startsWith("172.18.") ||
+        ip.startsWith("172.19.") ||
+        ip.startsWith("172.2") ||
+        ip.startsWith("172.30.") ||
+        ip.startsWith("172.31.") ||
+        ip === "127.0.0.1" ||
+        ip === "::1"
+    );
+}
+
+function inferLocationFromRequest(req: Request): InferredLocation | null {
+    const body = req.body as Record<string, unknown> | undefined;
+    const telephonyCandidate = pickLocationCandidate(
+        body?.telephony ?? body?.callMetadata ?? body?.providerMetadata
+    );
+    if (telephonyCandidate) {
+        return {
+            ...telephonyCandidate,
+            locationSource: "telephony",
+            locationConfidence: 0.95
+        };
+    }
+
+    const numberLookupCandidate = pickLocationCandidate(
+        body?.numberLookup ?? body?.number_lookup ?? body?.callerNumberLookup
+    );
+    if (numberLookupCandidate) {
+        return {
+            ...numberLookupCandidate,
+            locationSource: "number_lookup",
+            locationConfidence: 0.75
+        };
+    }
+
+    const ip = getClientIp(req);
+    if (ip && !isPrivateIp(ip)) {
+        // Coarse fallback only for demo: country-level.
+        return {
+            country: "US",
+            locationSource: "ip",
+            locationConfidence: 0.25
+        };
+    }
+
+    return null;
+}
+
+async function inferAndApplyLocation(caseRecord: CaseRecord, req: Request, trigger: string) {
+    const inferred = inferLocationFromRequest(req);
+    if (!inferred) {
+        console.log("[LOCATION] inference unavailable", {
+            caseId: caseRecord.id,
+            trigger,
+            fallbackReason: "no_usable_source"
+        });
+        return;
+    }
+
+    if (caseRecord.locationSource === "manual") {
+        console.log("[LOCATION] manual location preserved", {
+            caseId: caseRecord.id,
+            trigger,
+            source: caseRecord.locationSource
+        });
+        return;
+    }
+
+    const currentScore = caseRecord.locationConfidence ?? -1;
+    if (
+        currentScore > inferred.locationConfidence &&
+        (caseRecord.city || caseRecord.state || caseRecord.zip || caseRecord.country)
+    ) {
+        console.log("[LOCATION] existing higher-confidence location retained", {
+            caseId: caseRecord.id,
+            trigger,
+            currentScore,
+            inferredScore: inferred.locationConfidence
+        });
+        return;
+    }
+
+    caseRecord.city = inferred.city ?? caseRecord.city;
+    caseRecord.state = inferred.state ?? caseRecord.state;
+    caseRecord.zip = inferred.zip ?? caseRecord.zip;
+    caseRecord.country = inferred.country ?? caseRecord.country;
+    caseRecord.locationSource = inferred.locationSource;
+    caseRecord.locationConfidence = inferred.locationConfidence;
+    caseRecord.locationUpdatedAt = new Date().toISOString();
+
+    const saved = await saveAndBroadcast(caseRecord, "case.location.updated");
+    console.log("[LOCATION] inferred", {
+        caseId: saved.id,
+        trigger,
+        chosenSource: inferred.locationSource,
+        city: saved.city ?? null,
+        state: saved.state ?? null,
+        zip: saved.zip ?? null,
+        country: saved.country ?? null,
+        confidence: inferred.locationConfidence
+    });
 }
 
 function adminAuthPlaceholder(
@@ -271,7 +585,7 @@ async function runKbIngestion(docId: string): Promise<void> {
 
 async function getCaseOr404(res: Response, caseId: string): Promise<CaseRecord | null> {
     const found = await caseStore.get(caseId);
-    if (!found || !isCaseDisplayable(found)) {
+    if (!found) {
         res.status(404).json({ error: "Case not found" });
         return null;
     }
@@ -286,8 +600,28 @@ function getParamValue(value: string | string[] | undefined): string {
 }
 
 async function saveAndBroadcast(caseRecord: CaseRecord, event = "case.updated") {
-    caseRecord.updatedAt = new Date().toISOString();
-    const saved = await caseStore.save(caseRecord);
+    const normalized: CaseRecord = {
+        ...caseRecord,
+        updatedAt: new Date().toISOString(),
+        locationSource: caseRecord.locationSource ?? null,
+        locationConfidence:
+            typeof caseRecord.locationConfidence === "number" &&
+            Number.isFinite(caseRecord.locationConfidence)
+                ? Math.max(0, Math.min(1, caseRecord.locationConfidence))
+                : null,
+        locationUpdatedAt: caseRecord.locationUpdatedAt ?? null,
+        context: {
+            ...caseRecord.context,
+            confidence:
+                typeof caseRecord.context.confidence === "number" &&
+                Number.isFinite(caseRecord.context.confidence)
+                    ? Math.max(0, Math.min(1, caseRecord.context.confidence))
+                    : null
+        },
+        images: caseRecord.images.map((f) => ({ ...f, summary: f.summary ?? null })),
+        protocols: caseRecord.protocols.map((f) => ({ ...f, summary: f.summary ?? null }))
+    };
+    const saved = await caseStore.save(normalized);
     eventBus.publish(saved.id, event, saved);
     return saved;
 }
@@ -307,13 +641,23 @@ app.post("/token", async (req, res) => {
         return res.status(404).json({ error: "Case not found for provided caseId" });
     }
 
+    const refreshedCase = caseRecord;
+
     const token = new AccessToken(
         env.livekitApiKey,
         env.livekitApiSecret,
         {
             identity,
             metadata: JSON.stringify({
-                caseId: caseId ?? null
+                caseId,
+                inferredLocation: {
+                    city: refreshedCase.city ?? null,
+                    state: refreshedCase.state ?? null,
+                    zip: refreshedCase.zip ?? null,
+                    country: refreshedCase.country ?? null,
+                    source: refreshedCase.locationSource ?? null,
+                    confidence: refreshedCase.locationConfidence ?? null
+                }
             })
         }
     );
@@ -329,7 +673,7 @@ app.post("/token", async (req, res) => {
         caseId,
         room,
         identity,
-        writeTargetCaseId: caseRecord.id
+        writeTargetCaseId: refreshedCase.id
     });
 
     res.json({
@@ -338,6 +682,91 @@ app.post("/token", async (req, res) => {
         room,
         caseId
     });
+});
+
+app.post("/agent/dispatch", async (req, res) => {
+    const room =
+        typeof req.body?.room === "string" && req.body.room.trim().length > 0
+            ? req.body.room.trim()
+            : "";
+    const caseId =
+        typeof req.body?.caseId === "string" && req.body.caseId.trim().length > 0
+            ? req.body.caseId.trim()
+            : "";
+    const identity =
+        typeof req.body?.identity === "string" && req.body.identity.trim().length > 0
+            ? req.body.identity.trim()
+            : undefined;
+
+    if (!room) {
+        return badRequest(res, "room is required");
+    }
+    if (!caseId) {
+        return badRequest(res, "caseId is required");
+    }
+
+    const record = await caseStore.get(caseId);
+    if (!record) {
+        return res.status(404).json({ error: "Case not found for provided caseId" });
+    }
+
+    try {
+        const dispatches = await dispatchClient.listDispatch(room);
+        const alreadyDispatched = dispatches.find(
+            (d) => d.agentName === env.livekitAgentName
+        );
+        if (alreadyDispatched) {
+            console.log("[VOICE] agent dispatch idempotent-hit", {
+                caseId,
+                room,
+                identity: identity ?? null,
+                agentName: env.livekitAgentName,
+                dispatchId: alreadyDispatched.id
+            });
+            return res.json({
+                ok: true,
+                room,
+                caseId,
+                agentName: env.livekitAgentName,
+                dispatchId: alreadyDispatched.id,
+                reused: true
+            });
+        }
+
+        const dispatch = await dispatchClient.createDispatch(room, env.livekitAgentName, {
+            metadata: JSON.stringify({
+                caseId,
+                identity: identity ?? null
+            })
+        });
+
+        console.log("[VOICE] agent dispatch created", {
+            caseId,
+            room,
+            identity: identity ?? null,
+            agentName: env.livekitAgentName,
+            dispatchId: dispatch.id
+        });
+        return res.status(201).json({
+            ok: true,
+            room,
+            caseId,
+            agentName: env.livekitAgentName,
+            dispatchId: dispatch.id
+        });
+    } catch (error) {
+        console.error("[VOICE] agent dispatch failed", {
+            caseId,
+            room,
+            identity: identity ?? null,
+            agentName: env.livekitAgentName,
+            message: error instanceof Error ? error.message : "unknown"
+        });
+        return res.status(502).json({
+            error: "Failed to dispatch agent",
+            code: "AGENT_DISPATCH_FAILED"
+        });
+    }
 });
 
 app.get("/health", (_req, res) => {
@@ -484,30 +913,31 @@ app.post("/cases", async (req, res) => {
         typeof zip === "string" && zip.trim().length > 0 ? zip.trim() : undefined;
     const normalizedAnimal =
         typeof animal === "string" && animal.trim().length > 0 ? animal.trim() : undefined;
-    if (isUnknownOrEmpty(normalizedAnimal) || isUnknownOrEmpty(normalizedCity)) {
-        return badRequest(
-            res,
-            "Case must include valid animal and city (not unknown/undefined/null/empty)"
-        );
-    }
 
     const now = new Date().toISOString();
     const newCase: CaseRecord = {
         id: crypto.randomUUID(),
+        publicReferenceId: await generateUniquePublicReferenceId(),
         roomName: roomName ?? `rescue-${Date.now()}`,
         status: "open",
         createdAt: now,
         updatedAt: now,
         callerName,
-        callerPhone,
+        callerPhone: callerPhone ? normalizeSpokenPhone(callerPhone) ?? callerPhone : undefined,
         animal: normalizedAnimal,
         city: normalizedCity,
+        state: undefined,
         zip: normalizedZip,
+        country: undefined,
+        locationSource: null,
+        locationConfidence: null,
+        locationUpdatedAt: null,
         transcript: [],
         images: [],
         protocols: [],
         guidanceSteps: [],
         context: {
+            confidence: null,
             sourceDocuments: [],
             rescueCenters: findRescueCenters({ city: normalizedCity, zip: normalizedZip })
         }
@@ -524,7 +954,7 @@ app.post("/cases", async (req, res) => {
         });
     }
     eventBus.publish(saved.id, "case.created", saved);
-    res.status(201).json(saved);
+    res.status(201).json(withCaseResponseShape(req, saved));
 });
 
 app.get("/cases/:caseId", async (req, res) => {
@@ -532,7 +962,7 @@ app.get("/cases/:caseId", async (req, res) => {
     if (!record) {
         return;
     }
-    res.json(record);
+    res.json(withCaseResponseShape(req, record));
 });
 
 app.get("/cases", async (req, res) => {
@@ -549,9 +979,8 @@ app.get("/cases", async (req, res) => {
             ? Number(pageSizeRaw)
             : 20;
 
-    const validStatuses: CaseStatus[] = ["open", "triaged", "guidance_provided", "closed"];
     const status =
-        typeof statusRaw === "string" && validStatuses.includes(statusRaw as CaseStatus)
+        typeof statusRaw === "string" && allowedCaseStatuses.includes(statusRaw as CaseStatus)
             ? (statusRaw as CaseStatus)
             : undefined;
 
@@ -563,10 +992,10 @@ app.get("/cases", async (req, res) => {
     const displayableItems = result.items.filter((record) => isCaseDisplayable(record));
 
     res.json({
-        items: displayableItems,
+        items: displayableItems.map((record) => withCaseResponseShape(req, record)),
         page: result.page,
         pageSize: result.pageSize,
-        total: displayableItems.length
+        total: result.total
     });
 });
 
@@ -582,17 +1011,42 @@ app.patch("/cases/:caseId/intake", async (req, res) => {
     }
 
     record.callerName = body.callerName ?? record.callerName;
-    record.callerPhone = body.callerPhone ?? record.callerPhone;
+    if (typeof body.callerPhone === "string") {
+        record.callerPhone = normalizeSpokenPhone(body.callerPhone) ?? body.callerPhone.trim();
+    }
+    const previousLocation = {
+        city: record.city,
+        state: record.state,
+        zip: record.zip,
+        country: record.country,
+        source: record.locationSource
+    };
     record.city = body.city ?? record.city;
+    record.state = body.state ?? record.state;
     record.zip = body.zip ?? record.zip;
+    record.country = body.country ?? record.country;
     record.animal = body.animal ?? record.animal;
     record.location = body.location ?? record.location;
     record.injury = body.injury ?? record.injury;
     record.aggression = body.aggression ?? record.aggression;
     record.collar = body.collar ?? record.collar;
+    if (
+        body.city !== undefined ||
+        body.state !== undefined ||
+        body.zip !== undefined ||
+        body.country !== undefined
+    ) {
+        record.locationSource = "manual";
+        record.locationConfidence = 1;
+        record.locationUpdatedAt = new Date().toISOString();
+        console.log("[LOCATION] manual override", {
+            caseId: record.id,
+            previousLocation
+        });
+    }
 
     const saved = await saveAndBroadcast(record);
-    res.json(saved);
+    res.json(withCaseResponseShape(req, saved));
 });
 
 app.post("/cases/:caseId/transcript", async (req, res) => {
@@ -608,10 +1062,13 @@ app.post("/cases/:caseId/transcript", async (req, res) => {
 
     if (final !== false) {
         record.transcript.push(text.trim());
+        const normalizedPhone = normalizeSpokenPhone(text);
+        if (normalizedPhone) {
+            record.callerPhone = normalizedPhone;
+        }
     }
-
     const saved = await saveAndBroadcast(record, "transcript.updated");
-    res.json(saved);
+    res.json(withCaseResponseShape(req, saved));
 });
 
 app.post(
@@ -633,18 +1090,26 @@ app.post(
             mimeType: req.file.mimetype,
             size: req.file.size,
             localPath: req.file.path,
+            url: `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`,
             uploadedAt: new Date().toISOString()
         };
 
         record.images.push(uploaded);
         let imageSummary = "";
         try {
-            imageSummary = await qwen.summarizeImage(uploaded.localPath);
-            if (imageSummary.trim().length > 0) {
-                uploaded.summary = imageSummary.trim();
+            const vision = await qwen.analyzeImage(uploaded.localPath);
+            if (vision) {
+                if (vision.summary.trim().length > 0) {
+                    uploaded.summary = vision.summary.trim();
+                    imageSummary = vision.summary.trim();
+                }
+                uploaded.speciesGuess = vision.speciesGuess;
+                uploaded.speciesConfidence = vision.speciesConfidence;
+                uploaded.isLikelyEndangered = vision.isLikelyEndangered;
+                uploaded.endangeredConfidence = vision.endangeredConfidence;
             }
         } catch (error) {
-            console.warn("[IMAGE] summary failed", {
+            console.warn("[IMAGE] analysis failed", {
                 caseId: record.id,
                 imageId: uploaded.id,
                 message: error instanceof Error ? error.message : "unknown"
@@ -684,7 +1149,7 @@ app.post(
             });
         }
         const saved = await saveAndBroadcast(record, "image.uploaded");
-        res.status(201).json(saved);
+        res.status(201).json(withCaseResponseShape(req, saved));
     }
 );
 
@@ -712,6 +1177,7 @@ app.post(
             mimeType: req.file.mimetype,
             size: req.file.size,
             localPath: req.file.path,
+            url: `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`,
             uploadedAt: new Date().toISOString()
         };
 
@@ -724,7 +1190,7 @@ app.post(
         }
 
         const saved = await saveAndBroadcast(record, "protocol.uploaded");
-        res.status(201).json(saved);
+        res.status(201).json(withCaseResponseShape(req, saved));
     }
 );
 
@@ -734,6 +1200,31 @@ app.post("/cases/:caseId/analyze", async (req, res) => {
         return;
     }
     const force = req.body?.force === true;
+    if (!force && record.status === "open") {
+        return res.status(409).json({
+            error: "Case is still open. Start/join voice session before analyze.",
+            code: "CASE_NOT_READY_FOR_ANALYZE",
+            caseId: record.id
+        });
+    }
+    const hasVoiceIntake =
+        record.transcript.some((t) => typeof t === "string" && t.trim().length > 0) ||
+        !isUnknownOrEmpty(record.callerName) ||
+        !isUnknownOrEmpty(record.callerPhone) ||
+        !isUnknownOrEmpty(record.injury) ||
+        !isUnknownOrEmpty(record.aggression) ||
+        !isUnknownOrEmpty(record.location) ||
+        !isUnknownOrEmpty(record.city) ||
+        !isUnknownOrEmpty(record.zip);
+
+    if (!force && !hasVoiceIntake) {
+        return res.status(409).json({
+            error: "Case intake is incomplete. Analyze after voice intake begins.",
+            code: "CASE_INTAKE_INCOMPLETE",
+            caseId: record.id
+        });
+    }
+
     if (
         !force &&
         record.status === "guidance_provided" &&
@@ -768,7 +1259,59 @@ app.post("/cases/:caseId/analyze", async (req, res) => {
     record.status = "guidance_provided";
 
     const saved = await saveAndBroadcast(record, "analysis.completed");
-    res.json(saved);
+    res.json(withCaseResponseShape(req, saved));
+});
+
+app.post("/cases/:caseId/session-complete", async (req, res) => {
+    const caseId = getParamValue(req.params.caseId).trim();
+    if (!caseId) {
+        return badRequest(res, "caseId is required");
+    }
+    const record = await getCaseOr404(res, caseId);
+    if (!record) {
+        return;
+    }
+
+    const payload = {
+        caseId: record.id,
+        room: typeof req.body?.room === "string" ? req.body.room : record.roomName,
+        identity: typeof req.body?.identity === "string" ? req.body.identity : null,
+        finalMessage:
+            typeof req.body?.finalMessage === "string" ? req.body.finalMessage : null,
+        completedAt: new Date().toISOString()
+    };
+    eventBus.publish(record.id, "session_complete", payload);
+    eventBus.publish(record.id, "agent_final_message", payload);
+    res.status(202).json({ ok: true, ...payload });
+});
+
+app.patch("/cases/:caseId/status", async (req, res) => {
+    const caseId = getParamValue(req.params.caseId).trim();
+    if (!caseId) {
+        return res.status(404).json({ error: "Case not found" });
+    }
+
+    const record = await getCaseOr404(res, caseId);
+    if (!record) {
+        return;
+    }
+
+    const rawStatus = req.body?.status;
+    if (typeof rawStatus !== "string" || rawStatus.trim().length === 0) {
+        return badRequest(res, "status is required");
+    }
+
+    const nextStatus = rawStatus.trim() as CaseStatus;
+    if (!allowedCaseStatuses.includes(nextStatus)) {
+        return badRequest(
+            res,
+            `Invalid status. Allowed values: ${allowedCaseStatuses.join(", ")}`
+        );
+    }
+
+    record.status = nextStatus;
+    const saved = await saveAndBroadcast(record, "case.status.updated");
+    res.json(withCaseResponseShape(req, saved));
 });
 
 app.get("/cases/:caseId/recommendations", async (req, res) => {
@@ -800,7 +1343,7 @@ app.post("/cases/:caseId/close", async (req, res) => {
 
     record.status = "closed";
     const saved = await saveAndBroadcast(record, "case.closed");
-    res.json(saved);
+    res.json(withCaseResponseShape(req, saved));
 });
 
 app.get("/events/kb", async (req, res) => {

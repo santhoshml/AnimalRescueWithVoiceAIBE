@@ -17,9 +17,9 @@
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.1063.0",
     "@aws-sdk/lib-dynamodb": "^3.1063.0",
-    "@inferedge/moss": "^1.0.0-beta.8",
     "@livekit/agents": "^1.4.5",
     "@livekit/rtc-node": "^0.13.29",
+    "@moss-dev/moss": "^1.1.0",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",

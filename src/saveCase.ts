@@ -1,8 +1,6 @@
 import type { RescueCase } from "./rescueLogic.js";
-import { CaseStore } from "./services/caseStore.js";
+import { env } from "./config/env.js";
 import type { CaseRecord } from "./types/case.js";
-
-const caseStore = new CaseStore();
 
 type SaveCaseOptions = {
     roomName?: string;
@@ -20,12 +18,12 @@ export async function saveCase(rescueCase: RescueCase, options?: SaveCaseOptions
         ? options.roomName
         : `voice-${Date.now()}`;
     const resolvedCaseId = options.caseId.trim();
-    const existing = await caseStore.get(resolvedCaseId);
+    const existing = await getCaseById(resolvedCaseId);
     if (!existing) {
         throw new Error(`VOICE_CASE_NOT_FOUND:${resolvedCaseId}`);
     }
-    if (isUnknownOrEmpty(rescueCase.animal) || isUnknownOrEmpty(rescueCase.location)) {
-        throw new Error("VOICE_CASE_INCOMPLETE_ANIMAL_OR_CITY");
+    if (isUnknownOrEmpty(rescueCase.animal)) {
+        throw new Error("VOICE_CASE_INCOMPLETE_ANIMAL");
     }
 
     const item: CaseRecord = {
@@ -34,8 +32,8 @@ export async function saveCase(rescueCase: RescueCase, options?: SaveCaseOptions
         updatedAt: now,
         status: "guidance_provided",
         animal: rescueCase.animal,
-        location: rescueCase.location,
-        city: rescueCase.location,
+        location: rescueCase.location ?? existing.location,
+        city: rescueCase.location ?? existing.city,
         injury: rescueCase.injury,
         aggression: rescueCase.aggression,
         collar: rescueCase.collar,
@@ -57,9 +55,27 @@ export async function saveCase(rescueCase: RescueCase, options?: SaveCaseOptions
         targetCaseRoomName: item.roomName
     });
 
-    await caseStore.save(item);
+    const intakeSaved = await patchIntake(item.id, {
+        callerName: item.callerName,
+        callerPhone: item.callerPhone,
+        city: item.city,
+        state: item.state,
+        zip: item.zip,
+        country: item.country,
+        animal: item.animal,
+        location: item.location,
+        injury: item.injury,
+        aggression: item.aggression,
+        collar: item.collar
+    });
 
-    return item;
+    const mergedTranscript = buildTranscript(rescueCase).join(" ");
+    if (mergedTranscript.trim().length > 0) {
+        await postTranscript(item.id, mergedTranscript.trim());
+    }
+
+    await patchStatus(item.id, "guidance_provided");
+    return intakeSaved;
 }
 
 function isUnknownOrEmpty(value: unknown): boolean {
@@ -101,4 +117,69 @@ function buildTranscript(rescueCase: RescueCase): string[] {
     }
 
     return entries;
+}
+
+function getCaseApiBaseUrl(): string {
+    if (process.env.CASE_API_BASE_URL && process.env.CASE_API_BASE_URL.trim().length > 0) {
+        return process.env.CASE_API_BASE_URL.trim().replace(/\/+$/, "");
+    }
+    return `http://127.0.0.1:${env.port}`;
+}
+
+async function getCaseById(caseId: string): Promise<CaseRecord | null> {
+    const baseUrl = getCaseApiBaseUrl();
+    const response = await fetch(`${baseUrl}/cases/${encodeURIComponent(caseId)}`);
+    if (response.status === 404) {
+        return null;
+    }
+    if (!response.ok) {
+        throw new Error(`VOICE_CASE_LOOKUP_FAILED:${response.status}`);
+    }
+    return (await response.json()) as CaseRecord;
+}
+
+async function patchIntake(
+    caseId: string,
+    body: Partial<CaseRecord>
+): Promise<CaseRecord> {
+    const baseUrl = getCaseApiBaseUrl();
+    const response = await fetch(`${baseUrl}/cases/${encodeURIComponent(caseId)}/intake`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+    });
+    if (!response.ok) {
+        throw new Error(`VOICE_CASE_INTAKE_UPDATE_FAILED:${response.status}`);
+    }
+    return (await response.json()) as CaseRecord;
+}
+
+async function postTranscript(caseId: string, text: string): Promise<void> {
+    const baseUrl = getCaseApiBaseUrl();
+    const response = await fetch(`${baseUrl}/cases/${encodeURIComponent(caseId)}/transcript`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, final: true })
+    });
+    if (!response.ok) {
+        console.warn("[VOICE] transcript update failed", {
+            caseId,
+            status: response.status
+        });
+    }
+}
+
+async function patchStatus(caseId: string, status: string): Promise<void> {
+    const baseUrl = getCaseApiBaseUrl();
+    const response = await fetch(`${baseUrl}/cases/${encodeURIComponent(caseId)}/status`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status })
+    });
+    if (!response.ok) {
+        console.warn("[VOICE] status update failed", {
+            caseId,
+            statusCode: response.status
+        });
+    }
 }

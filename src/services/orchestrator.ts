@@ -18,7 +18,7 @@ export class CaseOrchestrator {
     ): Promise<AnalyzeCaseResult> {
         const latestImage = caseRecord.images[caseRecord.images.length - 1];
         let species = caseRecord.context.species ?? "Unknown animal";
-        let confidence = caseRecord.context.confidence ?? 0;
+        let confidence = caseRecord.context.confidence ?? null;
 
         if (latestImage) {
             try {

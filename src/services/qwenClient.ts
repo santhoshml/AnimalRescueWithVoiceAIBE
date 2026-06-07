@@ -11,6 +11,40 @@ type SpeciesResult = {
     confidence: number;
 };
 
+export type VisionAssessment = {
+    summary: string;
+    speciesGuess: string | null;
+    speciesConfidence: number | null;
+    isLikelyEndangered: boolean | null;
+    endangeredConfidence: number | null;
+};
+
+type VisionAssessmentRaw = {
+    summary?: unknown;
+    speciesGuess?: unknown;
+    speciesConfidence?: unknown;
+    isLikelyEndangered?: unknown;
+    endangeredConfidence?: unknown;
+};
+
+function parseJsonObject<T>(content: string): T | null {
+    const trimmed = content.trim();
+    const fenceMatch = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+    const candidate = (fenceMatch?.[1] ?? trimmed).trim();
+    try {
+        return JSON.parse(candidate) as T;
+    } catch {
+        return null;
+    }
+}
+
+function normalize01(value: unknown): number | null {
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+        return null;
+    }
+    return Math.max(0, Math.min(1, value));
+}
+
 export class QwenClient {
     private get isConfigured(): boolean {
         return Boolean(
@@ -113,8 +147,13 @@ export class QwenClient {
     }
 
     async summarizeImage(localPath: string): Promise<string> {
+        const analysis = await this.analyzeImage(localPath);
+        return analysis?.summary ?? "";
+    }
+
+    async analyzeImage(localPath: string): Promise<VisionAssessment | null> {
         if (!this.isConfigured) {
-            return "";
+            return null;
         }
 
         const bytes = await readFile(localPath);
@@ -129,16 +168,20 @@ export class QwenClient {
             body: JSON.stringify({
                 model: env.qwenVisionModel,
                 temperature: 0.1,
+                response_format: { type: "json_object" },
                 messages: [
                     {
                         role: "system",
                         content:
-                            "You are an animal rescue assistant. Summarize the image in 1-2 concise sentences, focusing on visible animal condition and immediate safety signals."
+                            "You are an animal rescue vision assistant. Return strict JSON with keys: summary (string, 1-2 concise sentences), speciesGuess (string|null), speciesConfidence (number 0..1|null), isLikelyEndangered (boolean|null), endangeredConfidence (number 0..1|null). Use null for unknown values."
                     },
                     {
                         role: "user",
                         content: [
-                            { type: "text", text: "Provide a concise image summary." },
+                            {
+                                type: "text",
+                                text: "Analyze this rescue image and return the JSON object only."
+                            },
                             { type: "image_url", image_url: { url: dataUrl } }
                         ]
                     }
@@ -153,6 +196,31 @@ export class QwenClient {
         const data = (await response.json()) as {
             choices?: Array<{ message?: { content?: string } }>;
         };
-        return data.choices?.[0]?.message?.content?.trim() ?? "";
+        const content = data.choices?.[0]?.message?.content?.trim() ?? "";
+        if (content.length === 0) {
+            return null;
+        }
+        const parsed = parseJsonObject<VisionAssessmentRaw>(content);
+        if (!parsed) {
+            return {
+                summary: content,
+                speciesGuess: null,
+                speciesConfidence: null,
+                isLikelyEndangered: null,
+                endangeredConfidence: null
+            };
+        }
+
+        return {
+            summary: typeof parsed.summary === "string" ? parsed.summary.trim() : "",
+            speciesGuess:
+                typeof parsed.speciesGuess === "string" && parsed.speciesGuess.trim().length > 0
+                    ? parsed.speciesGuess.trim()
+                    : null,
+            speciesConfidence: normalize01(parsed.speciesConfidence),
+            isLikelyEndangered:
+                typeof parsed.isLikelyEndangered === "boolean" ? parsed.isLikelyEndangered : null,
+            endangeredConfidence: normalize01(parsed.endangeredConfidence)
+        };
     }
 }

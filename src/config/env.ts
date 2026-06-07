@@ -14,6 +14,7 @@ export const env = {
     livekitUrl: getRequired("LIVEKIT_URL"),
     livekitApiKey: getRequired("LIVEKIT_API_KEY"),
     livekitApiSecret: getRequired("LIVEKIT_API_SECRET"),
+    livekitAgentName: process.env.LIVEKIT_AGENT_NAME ?? "animal-rescue-dispatcher",
 
     awsRegion: process.env.AWS_REGION,
     dynamodbTable: process.env.DYNAMODB_TABLE,
